@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# claude-auto-resume — resume Claude Code sessions a usage limit interrupted.
+# Reads the queue written by hooks/queue-interrupted-session.py. When one
+# probe succeeds, each queued session is resumed headlessly, one at a time:
+#   claude -p --resume <id> --permission-mode $CLAUDE_RESUME_PERMISSION "<prompt>"
+# Output lands in $CLAUDE_RESUME_DIR/<session>.md. Run it from launchd/systemd
+# every few minutes, or by hand.
+set -uo pipefail
+QUEUE="${CLAUDE_RESUME_QUEUE:-$HOME/.claude/cache/rate-limit-queue.jsonl}"
+OUT="${CLAUDE_RESUME_DIR:-$HOME/.claude/cache/resumed}"; LOG="$OUT/auto-resume.log"
+LOCK="$OUT/.lock"
+PERM="${CLAUDE_RESUME_PERMISSION:-acceptEdits}"
+MAX_AGE="${CLAUDE_RESUME_MAX_AGE:-86400}"
+PROMPT="${CLAUDE_RESUME_PROMPT:-Quota is back after a usage limit interrupted this session. Continue where you left off. Re-run any background agent or command that failed with a session/usage limit. When done, summarise what was completed.}"
+RL_RE="${CLAUDE_RATE_LIMIT_RE:-429|cooling down|usage limit|rate.?limit|resets at|session limit}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$OUT"
+[[ -s "$QUEUE" ]] || exit 0
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK"' EXIT
+log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+notify() { command -v osascript >/dev/null && osascript -e "display notification \"$1\" with title \"Claude auto-resume\"" >/dev/null 2>&1; command -v notify-send >/dev/null && notify-send "Claude auto-resume" "$1"; true; }
+mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+
+"$HERE/claude-quota-probe" >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 ]] && { log "probe rc=$rc; $(wc -l < "$QUEUE" | tr -d ' ') queued, waiting"; exit 0; }
+
+transcript_of() { local slug; slug="$(sed 's#[/.]#-#g' <<<"$2")"; echo "$HOME/.claude/projects/$slug/$1.jsonl"; }
+field() { python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get(sys.argv[2],""))' "$1" "$2"; }
+
+mv "$QUEUE" "$QUEUE.work"; : > "$QUEUE"
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  sid="$(field "$line" session_id)"; cwd="$(field "$line" cwd)"; ts="$(field "$line" ts)"; ts="${ts%%.*}"
+  now=$(date +%s)
+  (( now - ts > MAX_AGE )) && { log "$sid: older than ${MAX_AGE}s, dropped"; continue; }
+  tr_path="$(transcript_of "$sid" "$cwd")"
+  if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
+  [[ -d "$cwd" ]] || cwd="$HOME"
+  log "$sid: resuming in $cwd"
+  ( cd "$cwd" && claude -p --resume "$sid" --permission-mode "$PERM" "$PROMPT" ) > "$OUT/$sid.md" 2> "$OUT/$sid.log" < /dev/null; rc=$?
+  if grep -qiE "$RL_RE" "$OUT/$sid.md" 2>/dev/null; then
+    log "$sid: limited again mid-resume, re-queued"; echo "$line" >> "$QUEUE"
+  else
+    log "$sid: resumed rc=$rc, report $OUT/$sid.md"; notify "Session ${sid:0:8} resumed (rc=$rc)"
+  fi
+done < "$QUEUE.work"
+rm -f "$QUEUE.work"

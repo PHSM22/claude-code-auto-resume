@@ -1,0 +1,6 @@
+[Unit]
+Description=Resume Claude Code sessions interrupted by a usage limit
+[Service]
+Type=oneshot
+ExecStart=__PREFIX__/bin/claude-auto-resume
+Environment=PATH=__PATH__

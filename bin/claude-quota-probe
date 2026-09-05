@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# claude-quota-probe — is Claude Code usable right now?
+# One tiny headless request. Exit 0 = usable, 1 = rate-limited, 2 = other
+# error (auth/network — not a quota signal; callers must not wait on it).
+#   claude-quota-probe [--model M] [--wait [--interval S] [--max S]]
+set -uo pipefail
+MODEL="${CLAUDE_PROBE_MODEL:-}" WAIT=0 INTERVAL="${CLAUDE_PROBE_INTERVAL:-300}" MAX="${CLAUDE_PROBE_MAX:-21600}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model) MODEL="$2"; shift 2;; --wait) WAIT=1; shift;;
+    --interval) INTERVAL="$2"; shift 2;; --max) MAX="$2"; shift 2;;
+    *) echo "claude-quota-probe: unknown arg $1" >&2; exit 2;;
+  esac
+done
+RL_RE="${CLAUDE_RATE_LIMIT_RE:-429|cooling down|usage limit|rate.?limit|resets at|out of extra usage|session limit}"
+probe() {
+  local out rc; local -a m=()
+  [[ -n "$MODEL" ]] && m=(--model "$MODEL")
+  out="$(cd / && claude -p "${m[@]}" --max-turns 1 --strict-mcp-config "--tools=Read" "Reply with the single word OK" 2>&1 < /dev/null)"; rc=$?
+  grep -qiE "$RL_RE" <<<"$out" && return 1
+  [[ $rc -eq 0 ]] && return 0
+  echo "claude-quota-probe: non-quota failure (rc=$rc): ${out:0:200}" >&2; return 2
+}
+start=$(date +%s)
+while :; do
+  probe; rc=$?
+  [[ $rc -ne 1 || $WAIT -eq 0 ]] && exit $rc
+  now=$(date +%s)
+  (( now - start >= MAX )) && { echo "claude-quota-probe: still limited after ${MAX}s" >&2; exit 1; }
+  echo "claude-quota-probe: rate-limited, retry in ${INTERVAL}s" >&2
+  sleep "$INTERVAL"
+done
