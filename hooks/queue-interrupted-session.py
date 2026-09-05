@@ -12,7 +12,9 @@ def main():
     except ValueError:
         payload = {}
     sid = payload.get("session_id")
-    if not sid:
+    # A headless resume that fails must not queue itself again (that loop
+    # re-ran two dead sessions every 5 minutes on 2026-09-05).
+    if not sid or os.environ.get("CLAUDE_AUTO_RESUME") == "1":
         return
     os.makedirs(os.path.dirname(QUEUE), exist_ok=True)
     with open(QUEUE, "a") as f:

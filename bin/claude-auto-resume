@@ -9,10 +9,16 @@ set -uo pipefail
 QUEUE="${CLAUDE_RESUME_QUEUE:-$HOME/.claude/cache/rate-limit-queue.jsonl}"
 OUT="${CLAUDE_RESUME_DIR:-$HOME/.claude/cache/resumed}"; LOG="$OUT/auto-resume.log"
 LOCK="$OUT/.lock"
-PERM="${CLAUDE_RESUME_PERMISSION:-acceptEdits}"
+# dontAsk: tools you pre-allowed in settings run, everything else is denied
+# without a prompt. acceptEdits made headless resumes of Desktop sessions
+# surface permission prompts in the Desktop app on every tick.
+PERM="${CLAUDE_RESUME_PERMISSION:-dontAsk}"
+MAX_ATTEMPTS="${CLAUDE_RESUME_MAX_ATTEMPTS:-2}"
+ATTEMPTS="$OUT/attempts.json"
 MAX_AGE="${CLAUDE_RESUME_MAX_AGE:-86400}"
 PROMPT="${CLAUDE_RESUME_PROMPT:-Quota is back after a usage limit interrupted this session. Continue where you left off. Re-run any background agent or command that failed with a session/usage limit. When done, summarise what was completed.}"
 RL_RE="${CLAUDE_RATE_LIMIT_RE:-429|cooling down|usage limit|rate.?limit|resets at|session limit}"
+TERMINAL_RE="${CLAUDE_TERMINAL_RE:-Prompt is too long|does not support this model|No conversation found}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$OUT"
 [[ -s "$QUEUE" ]] || exit 0
@@ -27,6 +33,13 @@ mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
 
 transcript_of() { local slug; slug="$(sed 's#[/.]#-#g' <<<"$2")"; echo "$HOME/.claude/projects/$slug/$1.jsonl"; }
 field() { python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get(sys.argv[2],""))' "$1" "$2"; }
+bump_attempts() {  # prints the new attempt count for session $1
+  python3 -c 'import json,sys
+p,sid=sys.argv[1:]
+try: d=json.load(open(p))
+except (OSError,ValueError): d={}
+d[sid]=d.get(sid,0)+1; json.dump(d,open(p,"w")); print(d[sid])' "$ATTEMPTS" "$1"
+}
 
 mv "$QUEUE" "$QUEUE.work"; : > "$QUEUE"
 while IFS= read -r line; do
@@ -37,9 +50,14 @@ while IFS= read -r line; do
   tr_path="$(transcript_of "$sid" "$cwd")"
   if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
   [[ -d "$cwd" ]] || cwd="$HOME"
-  log "$sid: resuming in $cwd"
-  ( cd "$cwd" && claude -p --resume "$sid" --permission-mode "$PERM" "$PROMPT" ) > "$OUT/$sid.md" 2> "$OUT/$sid.log" < /dev/null; rc=$?
-  if grep -qiE "$RL_RE" "$OUT/$sid.md" 2>/dev/null; then
+  n="$(bump_attempts "$sid")"
+  if (( n > MAX_ATTEMPTS )); then log "$sid: attempt $n exceeds $MAX_ATTEMPTS, dropped"; notify "Session ${sid:0:8} gave up after $MAX_ATTEMPTS resumes"; continue; fi
+  log "$sid: resuming in $cwd (attempt $n)"
+  # CLAUDE_AUTO_RESUME=1 tells the StopFailure hook not to re-queue this run.
+  ( cd "$cwd" && CLAUDE_AUTO_RESUME=1 claude -p --resume "$sid" --permission-mode "$PERM" "$PROMPT" ) > "$OUT/$sid.md" 2> "$OUT/$sid.log" < /dev/null; rc=$?
+  if grep -qiE "$TERMINAL_RE" "$OUT/$sid.md" 2>/dev/null; then
+    log "$sid: unrecoverable ($(head -c 120 "$OUT/$sid.md" | tr '\n' ' ')), dropped"; notify "Session ${sid:0:8} cannot be resumed; see $OUT/$sid.md"
+  elif grep -qiE "$RL_RE" "$OUT/$sid.md" 2>/dev/null; then
     log "$sid: limited again mid-resume, re-queued"; echo "$line" >> "$QUEUE"
   else
     log "$sid: resumed rc=$rc, report $OUT/$sid.md"; notify "Session ${sid:0:8} resumed (rc=$rc)"

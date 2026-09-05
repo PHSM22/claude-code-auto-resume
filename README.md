@@ -35,13 +35,14 @@ CLAUDE_TEST_MODEL=claude-sonnet-5 ./test.sh # or pin one
 - `~/.claude/cache/resumed/auto-resume.log` — what happened and when.
 - A desktop notification when a session is resumed.
 
-A session you already continued by hand is skipped (its transcript changed after it was queued). A session that hits the limit again mid-resume is re-queued. Entries older than 24h are dropped.
+A session you already continued by hand is skipped (its transcript changed after it was queued). A session that hits the limit again mid-resume is re-queued, at most `CLAUDE_RESUME_MAX_ATTEMPTS` times. Unrecoverable sessions (context too long, model no longer supported) are dropped with a notification. Entries older than 24h are dropped.
 
 ## Configuration (environment variables, set in the scheduler unit or before running by hand)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CLAUDE_RESUME_PERMISSION` | `acceptEdits` | `--permission-mode` for resumed sessions. Resumes are headless, so anything that would have prompted you is auto-accepted or refused. Use `default` to have it refuse instead. |
+| `CLAUDE_RESUME_PERMISSION` | `dontAsk` | `--permission-mode` for resumed sessions. `dontAsk` runs the tools you pre-allowed in settings and silently denies the rest; `acceptEdits` made Desktop sessions pop permission prompts on every tick. `bypassPermissions` if you accept the risk. |
+| `CLAUDE_RESUME_MAX_ATTEMPTS` | `2` | Resumes per session before it is dropped with a notification. |
 | `CLAUDE_RESUME_PROMPT` | "Quota is back… continue where you left off…" | The message the resumed session receives. |
 | `CLAUDE_RESUME_MAX_AGE` | `86400` | Seconds after which a queued session is dropped. |
 | `CLAUDE_PROBE_MODEL` | CLI default | Model for the probe request. |
