@@ -37,6 +37,10 @@ CLAUDE_TEST_MODEL=claude-sonnet-5 ./test.sh # or pin one
 
 A session you already continued by hand is skipped (its transcript changed after it was queued). A session that hits the limit again mid-resume is re-queued, at most `CLAUDE_RESUME_MAX_ATTEMPTS` times. Unrecoverable sessions (context too long, model no longer supported) are dropped with a notification. Entries older than 24h are dropped.
 
+## Guard: don't resume a session that is live elsewhere
+
+Resuming a session headlessly while it is already open and being driven in the Desktop app makes two writers fight over one session, so the resumer can ask an optional guard executable first. The guard is called as `guard <session-id> <cwd>`: exit 0 means "live elsewhere" and the entry is re-queued untouched (no attempt consumed) with a `guard says live elsewhere (<first line of guard output>), re-queued` log line, while any other exit resumes as usual. Configure it with `CLAUDE_RESUME_GUARD` (path to your executable), or drop an executable named `guard` next to `bin/` (`$PREFIX/guard` once installed); a configured guard that is not executable is logged once and ignored.
+
 ## Configuration (environment variables, set in the scheduler unit or before running by hand)
 
 | Variable | Default | Meaning |
