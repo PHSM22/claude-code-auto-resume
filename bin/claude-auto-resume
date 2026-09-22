@@ -28,9 +28,10 @@ trap 'rmdir "$LOCK"' EXIT
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 notify() { command -v osascript >/dev/null && osascript -e "display notification \"$1\" with title \"Claude auto-resume\"" >/dev/null 2>&1; command -v notify-send >/dev/null && notify-send "Claude auto-resume" "$1"; true; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
-# A non-numeric or non-positive timeout would silently disable the alarm
-# below (alarm 0 cancels it), so reject it and fall back to 30.
-if ! [[ "$GUARD_TIMEOUT" =~ ^[0-9]+$ ]] || ! (( GUARD_TIMEOUT > 0 )); then
+# A non-integer timeout, or one outside 1..3600, would silently disable the
+# alarm below (alarm 0 cancels it) or overflow perl's alarm into a negative
+# (unbounded) wait, so reject it and fall back to 30.
+if ! [[ "$GUARD_TIMEOUT" =~ ^[0-9]+$ ]] || (( ${#GUARD_TIMEOUT} > 10 || 10#$GUARD_TIMEOUT < 1 || 10#$GUARD_TIMEOUT > 3600 )); then
   log "guard timeout \"$GUARD_TIMEOUT\" invalid, using 30"
   GUARD_TIMEOUT=30
 fi
@@ -71,16 +72,24 @@ while IFS= read -r line; do
   if [[ -n "$GUARD" ]]; then
     if command -v perl >/dev/null 2>&1; then
       # Bounded supervisor: the guard runs in its own process group so that
-      # on timeout the whole tree dies — killing only the guard itself would
-      # leave a forked child holding the captured stdout pipe and keep $(...)
-      # open past the deadline. Timeout exits 124 (coreutils convention); a
-      # guard must therefore never exit 124 itself.
+      # the whole tree dies — killing only the guard itself would leave a
+      # forked child holding the captured stdout pipe and keep $(...) open
+      # past the deadline. The group kill runs on EVERY exit path: on timeout
+      # (ALRM handler) and after the guard exits however it exits, because a
+      # backgrounded descendant outlives a normally-exiting guard and holds
+      # the pipe just the same. The alarm stays armed until the kill has
+      # happened. Timeout exits 124 (coreutils convention); a guard must
+      # therefore never exit 124 itself.
       guard_out="$(perl -e '
+        use POSIX qw(WNOHANG);
         my $t = shift @ARGV; my $pid = fork;
         if (!defined $pid) { exit 127 }
         if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
-        $SIG{ALRM} = sub { kill "TERM", -$pid; select(undef,undef,undef,0.5); kill "KILL", -$pid; waitpid($pid, 0); exit 124 };
-        alarm $t; waitpid($pid, 0); alarm 0; exit(($? >> 8) || ($? & 127 ? 128 + ($? & 127) : 0));
+        sub killtree { kill "TERM", -$pid; select(undef,undef,undef,0.2); kill "KILL", -$pid; while (waitpid(-1, WNOHANG) > 0) {} }
+        $SIG{ALRM} = sub { killtree(); exit 124 };
+        alarm $t; waitpid($pid, 0); my $rc = $?;
+        killtree(); alarm 0;
+        exit(($rc >> 8) || ($rc & 127 ? 128 + ($rc & 127) : 0));
       ' "$GUARD_TIMEOUT" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
       if (( guard_rc == 124 )); then
         log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"

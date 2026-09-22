@@ -9,6 +9,12 @@
 #      bounds the whole resumer to timeout + 3s, resume happens
 #   5. CLAUDE_RESUME_GUARD_TIMEOUT=bogus -> invalid, falls back to 30, resume happens
 #   6. no perl on PATH -> guard skipped, never called, resume happens
+#   7. guard exits 1 at once but backgrounds `sleep 8` holding stdout ->
+#      post-exit group kill closes the pipe, resumer bounded (< 4s), resume happens
+#   8. same backgrounded child, guard exits 0 (live) -> still bounded (< 4s),
+#      entry re-queued, no resume call
+#   9. CLAUDE_RESUME_GUARD_TIMEOUT=99999999999 -> invalid, falls back to 30,
+#      immediate-exit guard, run completes bounded
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PASS=0; FAIL=0
@@ -131,6 +137,42 @@ grep -q "guard skipped: perl not found" "$LOG" 2>/dev/null && pass "case 6: log 
 grep -q -- "--resume" "$CALLS" && pass "case 6: --resume call happened" || fail "case 6: no --resume call: $(cat "$CALLS" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 6: queue empty" || fail "case 6: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 [[ ! -e "$T/guard-called.txt" ]] && pass "case 6: guard never executed" || fail "case 6: guard ran with no perl to bound it"
+
+# --- Case 7: guard exits 1 at once, orphaned `sleep 8` holds the pipe ---
+# Without a post-exit group kill $(...) stays open ~8s; with it, < 4s.
+fresh_case 7
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 8 & exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+grep -q -- "--resume" "$CALLS" && pass "case 7: --resume call happened (proceed path)" || fail "case 7: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 7: queue empty" || fail "case 7: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+(( elapsed < 4 )) && pass "case 7: bounded in ${elapsed}s (< 4s)" || fail "case 7: took ${elapsed}s, orphan held the pipe"
+
+# --- Case 8: same orphan, live branch (exit 0) -> still bounded, re-queued ---
+fresh_case 8
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 8 & exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+diff <(echo "$LINE") "$QUEUE" >/dev/null && pass "case 8: queue still holds the line (live)" || fail "case 8: queue changed: $(cat "$QUEUE" 2>/dev/null)"
+! grep -q -- "--resume" "$CALLS" && pass "case 8: no --resume call" || fail "case 8: resume ran despite live guard"
+grep -q "live elsewhere" "$LOG" 2>/dev/null && pass "case 8: log says live elsewhere" || fail "case 8: log missing 'live elsewhere': $(cat "$LOG" 2>/dev/null)"
+(( elapsed < 4 )) && pass "case 8: bounded in ${elapsed}s (< 4s)" || fail "case 8: took ${elapsed}s, orphan held the pipe"
+
+# --- Case 9: gigantic numeric timeout -> invalid, falls back to 30 ---
+fresh_case 9
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=99999999999
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+grep -q 'guard timeout "99999999999" invalid, using 30' "$LOG" 2>/dev/null && pass "case 9: log says invalid, using 30" || fail "case 9: log missing invalid-timeout line: $(cat "$LOG" 2>/dev/null)"
+grep -q -- "--resume" "$CALLS" && pass "case 9: --resume call happened" || fail "case 9: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 9: queue empty" || fail "case 9: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+(( elapsed < 10 )) && pass "case 9: bounded in ${elapsed}s" || fail "case 9: took ${elapsed}s"
 
 echo "---"
 echo "$PASS passed, $FAIL failed"

@@ -44,7 +44,7 @@ Resuming a session headlessly while it is already open and being driven in the D
 The guard call is always bounded, or it is never made:
 
 - Every guard invocation runs under a `CLAUDE_RESUME_GUARD_TIMEOUT` (default `30` seconds) supervisor that puts the guard in its own process group and kills the whole group (TERM, then KILL) on expiry, so even a guard that forks a child holding stdout cannot stall the resumer. A guard that does not answer in time is treated as "not live" (the resume proceeds) with a `<sid>: guard timed out after <N>s, treated as not live` log line.
-- A non-numeric or non-positive `CLAUDE_RESUME_GUARD_TIMEOUT` is rejected with a `guard timeout "<value>" invalid, using 30` log line and 30 is used.
+- A `CLAUDE_RESUME_GUARD_TIMEOUT` that is not an integer in `[1, 3600]` is rejected with a `guard timeout "<value>" invalid, using 30` log line and 30 is used.
 - The supervisor needs `perl`. Without it the guard is not called at all: a `guard skipped: perl not found, cannot bound the call` line is logged and the resume proceeds. The guard is never run unbounded.
 
 ## Configuration (environment variables, set in the scheduler unit or before running by hand)
@@ -56,7 +56,7 @@ The guard call is always bounded, or it is never made:
 | `CLAUDE_RESUME_PROMPT` | "Quota is back… continue where you left off…" | The message the resumed session receives. |
 | `CLAUDE_RESUME_MAX_AGE` | `86400` | Seconds after which a queued session is dropped. |
 | `CLAUDE_RESUME_GUARD` | unset | Path to the optional live-session guard executable (or `$PREFIX/guard` by default). Requires `perl` so the call can be bounded; without it the guard is skipped. |
-| `CLAUDE_RESUME_GUARD_TIMEOUT` | `30` | Seconds bounding each guard call (whole process tree killed on expiry, treated as not live). Non-numeric or non-positive values fall back to 30. |
+| `CLAUDE_RESUME_GUARD_TIMEOUT` | `30` | Seconds bounding each guard call (whole process tree killed on expiry, treated as not live). Must be an integer in `[1, 3600]`; anything else falls back to 30. |
 | `CLAUDE_PROBE_MODEL` | CLI default | Model for the probe request. |
 | `CLAUDE_RATE_LIMIT_RE` | see scripts | Regex that identifies a usage-limit message. |
 | `CLAUDE_RESUME_QUEUE`, `CLAUDE_RESUME_DIR` | under `~/.claude/cache` | Paths. |
