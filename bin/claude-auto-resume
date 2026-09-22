@@ -28,6 +28,12 @@ trap 'rmdir "$LOCK"' EXIT
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 notify() { command -v osascript >/dev/null && osascript -e "display notification \"$1\" with title \"Claude auto-resume\"" >/dev/null 2>&1; command -v notify-send >/dev/null && notify-send "Claude auto-resume" "$1"; true; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+# A non-numeric or non-positive timeout would silently disable the alarm
+# below (alarm 0 cancels it), so reject it and fall back to 30.
+if ! [[ "$GUARD_TIMEOUT" =~ ^[0-9]+$ ]] || ! (( GUARD_TIMEOUT > 0 )); then
+  log "guard timeout \"$GUARD_TIMEOUT\" invalid, using 30"
+  GUARD_TIMEOUT=30
+fi
 # Optional guard: answers "is this session live elsewhere?" so a headless
 # resume never races a session already being driven in the desktop app.
 GUARD=""
@@ -64,18 +70,30 @@ while IFS= read -r line; do
   if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
   if [[ -n "$GUARD" ]]; then
     if command -v perl >/dev/null 2>&1; then
-      guard_out="$(perl -e 'alarm shift @ARGV; exec @ARGV' "$GUARD_TIMEOUT" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
+      # Bounded supervisor: the guard runs in its own process group so that
+      # on timeout the whole tree dies — killing only the guard itself would
+      # leave a forked child holding the captured stdout pipe and keep $(...)
+      # open past the deadline. Timeout exits 124 (coreutils convention); a
+      # guard must therefore never exit 124 itself.
+      guard_out="$(perl -e '
+        my $t = shift @ARGV; my $pid = fork;
+        if (!defined $pid) { exit 127 }
+        if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
+        $SIG{ALRM} = sub { kill "TERM", -$pid; select(undef,undef,undef,0.5); kill "KILL", -$pid; waitpid($pid, 0); exit 124 };
+        alarm $t; waitpid($pid, 0); alarm 0; exit(($? >> 8) || ($? & 127 ? 128 + ($? & 127) : 0));
+      ' "$GUARD_TIMEOUT" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
+      if (( guard_rc == 124 )); then
+        log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"
+      elif (( guard_rc == 0 )); then
+        guard_msg="$(head -n 1 <<<"$guard_out")"
+        log "$sid: guard says live elsewhere ($guard_msg), re-queued"
+        echo "$line" >> "$QUEUE"
+        continue
+      fi
     else
-      [[ -n "${GUARD_NOPERL_LOGGED:-}" ]] || { log "guard timeout unavailable (no perl)"; GUARD_NOPERL_LOGGED=1; }
-      guard_out="$("$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
-    fi
-    if (( guard_rc == 142 )); then
-      log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"
-    elif (( guard_rc == 0 )); then
-      guard_msg="$(head -n 1 <<<"$guard_out")"
-      log "$sid: guard says live elsewhere ($guard_msg), re-queued"
-      echo "$line" >> "$QUEUE"
-      continue
+      # Without perl there is no way to bound the call, so the guard is not
+      # called at all and the resume proceeds. Never run it unbounded.
+      log "guard skipped: perl not found, cannot bound the call"
     fi
   fi
   [[ -d "$cwd" ]] || cwd="$HOME"
