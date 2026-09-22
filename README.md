@@ -57,6 +57,7 @@ The guard call is always bounded, or it is never made:
 | `CLAUDE_RESUME_MAX_AGE` | `86400` | Seconds after which a queued session is dropped. |
 | `CLAUDE_RESUME_GUARD` | unset | Path to the optional live-session guard executable (or `$PREFIX/guard` by default). Requires `perl` so the call can be bounded; without it the guard is skipped. |
 | `CLAUDE_RESUME_GUARD_TIMEOUT` | `30` | Seconds bounding each guard call (whole process tree killed on expiry, treated as not live). Must be an integer in `[1, 3600]`; anything else falls back to 30. |
+| `CLAUDE_RESUME_GUARD_CLEANUP_S` | `0.2` | Test/diagnostic knob: seconds between TERM and KILL when cleaning up the guard's process group. Must be a number in `[0, 10]`; anything else falls back to 0.2. |
 | `CLAUDE_PROBE_MODEL` | CLI default | Model for the probe request. |
 | `CLAUDE_RATE_LIMIT_RE` | see scripts | Regex that identifies a usage-limit message. |
 | `CLAUDE_RESUME_QUEUE`, `CLAUDE_RESUME_DIR` | under `~/.claude/cache` | Paths. |

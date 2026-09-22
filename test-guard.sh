@@ -15,8 +15,12 @@
 #      entry re-queued, no resume call
 #   9. CLAUDE_RESUME_GUARD_TIMEOUT=99999999999 -> invalid, falls back to 30,
 #      immediate-exit guard, run completes bounded
-#  10. guard exits just before the deadline (sleep 1.2, timeout 2) -> NOT a
-#      timeout: exit 0 re-queues (live), exit 1 resumes (not live)
+#  10. guard exits mid-window (sleep 1, timeout 2, cleanup pause 3) -> NOT a
+#      timeout: exit 0 re-queues (live), exit 1 resumes (not live). The 3 s
+#      pause keeps the post-exit cleanup running past the 2 s deadline, so
+#      with the broken ordering (alarm still armed during cleanup) the alarm
+#      fires mid-cleanup and misreports the exit as 124; with the fix the
+#      alarm is disarmed first and the guard's own status wins.
 #  11. guard outlives the deadline (sleep 3, timeout 1) -> timeout branch,
 #      resume proceeds
 set -euo pipefail
@@ -54,7 +58,7 @@ fresh_case() {
   export CLAUDE_RESUME_QUEUE="$QUEUE" CLAUDE_RESUME_DIR="$OUT"
   export CLAUDE_CALLS_FILE="$CALLS" HOME="$T/home"
   export PATH="$T/bin:$PATH"
-  unset CLAUDE_RESUME_GUARD CLAUDE_RESUME_GUARD_TIMEOUT
+  unset CLAUDE_RESUME_GUARD CLAUDE_RESUME_GUARD_TIMEOUT CLAUDE_RESUME_GUARD_CLEANUP_S
 }
 
 # --- Case 1: guard says live (exit 0) -> re-queue untouched, no --resume ---
@@ -178,31 +182,34 @@ grep -q -- "--resume" "$CALLS" && pass "case 9: --resume call happened" || fail 
 [[ ! -s "$QUEUE" ]] && pass "case 9: queue empty" || fail "case 9: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 (( elapsed < 10 )) && pass "case 9: bounded in ${elapsed}s" || fail "case 9: took ${elapsed}s"
 
-# --- Case 10: guard exits just before the deadline -> NOT a timeout ---
-# The post-exit group kill takes ~0.2s past waitpid; the exit code must still
-# report what the guard did, never 124.
+# --- Case 10: guard exits inside the stretched cleanup window -> NOT a timeout ---
+# Timeout 2, cleanup pause 3, guard sleeps 1: the run takes ~4 s, proving the
+# pause really ran past the deadline. Float timing via python3: $SECONDS is
+# whole seconds and would straddle the 4 s boundary.
 fresh_case 10a
-printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 1.2; exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
-export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=2
-start=$SECONDS
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 1; exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=2 CLAUDE_RESUME_GUARD_CLEANUP_S=3
+t0=$(python3 -c 'import time; print(time.time())')
 "$HERE/bin/claude-auto-resume"
-elapsed=$(( SECONDS - start ))
+elapsed=$(python3 -c "import time; print(time.time() - $t0)")
 diff <(echo "$LINE") "$QUEUE" >/dev/null && pass "case 10a: queue still holds the line (live)" || fail "case 10a: queue changed: $(cat "$QUEUE" 2>/dev/null)"
 ! grep -q -- "--resume" "$CALLS" && pass "case 10a: no --resume call" || fail "case 10a: resume ran despite live guard"
 grep -q "live elsewhere" "$LOG" 2>/dev/null && pass "case 10a: log says live elsewhere" || fail "case 10a: log missing 'live elsewhere': $(cat "$LOG" 2>/dev/null)"
 ! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 10a: log has no timeout line" || fail "case 10a: misclassified as timeout: $(cat "$LOG" 2>/dev/null)"
-(( elapsed < 4 )) && pass "case 10a: bounded in ${elapsed}s (< 4s)" || fail "case 10a: took ${elapsed}s"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= 4 else 1)' "$elapsed" && pass "case 10a: cleanup pause ran (took ${elapsed}s, >= 4s)" || fail "case 10a: took ${elapsed}s, cleanup pause did not run"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 8 else 1)' "$elapsed" && pass "case 10a: bounded in ${elapsed}s (< 8s)" || fail "case 10a: took ${elapsed}s"
 
 fresh_case 10b
-printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 1.2; exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
-export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=2
-start=$SECONDS
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 1; exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=2 CLAUDE_RESUME_GUARD_CLEANUP_S=3
+t0=$(python3 -c 'import time; print(time.time())')
 "$HERE/bin/claude-auto-resume"
-elapsed=$(( SECONDS - start ))
+elapsed=$(python3 -c "import time; print(time.time() - $t0)")
 grep -q -- "--resume" "$CALLS" && pass "case 10b: --resume call happened (proceed path)" || fail "case 10b: no --resume call: $(cat "$CALLS" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 10b: queue empty" || fail "case 10b: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 ! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 10b: log has no timeout line" || fail "case 10b: misclassified as timeout: $(cat "$LOG" 2>/dev/null)"
-(( elapsed < 4 )) && pass "case 10b: bounded in ${elapsed}s (< 4s)" || fail "case 10b: took ${elapsed}s"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= 4 else 1)' "$elapsed" && pass "case 10b: cleanup pause ran (took ${elapsed}s, >= 4s)" || fail "case 10b: took ${elapsed}s, cleanup pause did not run"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 8 else 1)' "$elapsed" && pass "case 10b: bounded in ${elapsed}s (< 8s)" || fail "case 10b: took ${elapsed}s"
 
 # --- Case 11: guard outlives the deadline -> timeout branch, resume proceeds ---
 fresh_case 11
