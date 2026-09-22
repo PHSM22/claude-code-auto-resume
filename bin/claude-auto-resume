@@ -16,6 +16,7 @@ PERM="${CLAUDE_RESUME_PERMISSION:-dontAsk}"
 MAX_ATTEMPTS="${CLAUDE_RESUME_MAX_ATTEMPTS:-2}"
 ATTEMPTS="$OUT/attempts.json"
 MAX_AGE="${CLAUDE_RESUME_MAX_AGE:-86400}"
+GUARD_TIMEOUT="${CLAUDE_RESUME_GUARD_TIMEOUT:-30}"
 PROMPT="${CLAUDE_RESUME_PROMPT:-Quota is back after a usage limit interrupted this session. Continue where you left off. Re-run any background agent or command that failed with a session/usage limit. When done, summarise what was completed.}"
 RL_RE="${CLAUDE_RATE_LIMIT_RE:-429|cooling down|usage limit|rate.?limit|resets at|session limit}"
 TERMINAL_RE="${CLAUDE_TERMINAL_RE:-Prompt is too long|does not support this model|No conversation found}"
@@ -62,8 +63,15 @@ while IFS= read -r line; do
   tr_path="$(transcript_of "$sid" "$cwd")"
   if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
   if [[ -n "$GUARD" ]]; then
-    guard_out="$("$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
-    if (( guard_rc == 0 )); then
+    if command -v perl >/dev/null 2>&1; then
+      guard_out="$(perl -e 'alarm shift @ARGV; exec @ARGV' "$GUARD_TIMEOUT" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
+    else
+      [[ -n "${GUARD_NOPERL_LOGGED:-}" ]] || { log "guard timeout unavailable (no perl)"; GUARD_NOPERL_LOGGED=1; }
+      guard_out="$("$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
+    fi
+    if (( guard_rc == 142 )); then
+      log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"
+    elif (( guard_rc == 0 )); then
       guard_msg="$(head -n 1 <<<"$guard_out")"
       log "$sid: guard says live elsewhere ($guard_msg), re-queued"
       echo "$line" >> "$QUEUE"

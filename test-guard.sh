@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # test-guard.sh — hermetic tests for the resume guard in bin/claude-auto-resume.
 # No real `claude`, no network: a fake `claude` on PATH prints OK (no
-# rate-limit words, so the probe passes) and records every call. Three cases:
+# rate-limit words, so the probe passes) and records every call. Four cases:
 #   1. guard exits 0 (live elsewhere) -> re-queued untouched, no resume call
 #   2. guard exits 1 (not live)       -> resume call happens, queue empty
 #   3. no guard configured            -> same as 2
+#   4. guard hangs                     -> times out, treated as not live, resume happens
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PASS=0; FAIL=0
@@ -70,10 +71,20 @@ grep -q -- "--resume" "$CALLS" && pass "case 2: --resume call happened" || fail 
 
 # --- Case 3: no guard configured -> same as case 2 ---
 fresh_case 3
-unset CLAUDE_RESUME_GUARD
+export CLAUDE_RESUME_GUARD=/nonexistent/guard
 "$HERE/bin/claude-auto-resume"
 grep -q -- "--resume" "$CALLS" && pass "case 3: --resume call happened" || fail "case 3: no --resume call: $(cat "$CALLS" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 3: queue empty" || fail "case 3: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+
+# --- Case 4: guard hangs -> bounded by CLAUDE_RESUME_GUARD_TIMEOUT, resume proceeds ---
+fresh_case 4
+printf '#!/usr/bin/env bash\nsleep 5\nexit 1\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+"$HERE/bin/claude-auto-resume"
+grep -q -- "--resume" "$CALLS" && pass "case 4: --resume call happened despite hanging guard" || fail "case 4: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+grep -q "timed out" "$LOG" 2>/dev/null && pass "case 4: log says timed out" || fail "case 4: log missing 'timed out': $(cat "$LOG" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 4: queue empty" || fail "case 4: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+unset CLAUDE_RESUME_GUARD_TIMEOUT
 
 echo "---"
 echo "$PASS passed, $FAIL failed"
