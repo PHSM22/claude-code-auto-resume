@@ -27,6 +27,18 @@ trap 'rmdir "$LOCK"' EXIT
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 notify() { command -v osascript >/dev/null && osascript -e "display notification \"$1\" with title \"Claude auto-resume\"" >/dev/null 2>&1; command -v notify-send >/dev/null && notify-send "Claude auto-resume" "$1"; true; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+# Optional guard: answers "is this session live elsewhere?" so a headless
+# resume never races a session already being driven in the desktop app.
+GUARD=""
+if [[ -n "${CLAUDE_RESUME_GUARD:-}" ]]; then
+  if [[ -x "$CLAUDE_RESUME_GUARD" ]]; then
+    GUARD="$CLAUDE_RESUME_GUARD"
+  else
+    log "guard $CLAUDE_RESUME_GUARD not executable, ignored"
+  fi
+elif [[ -x "$HERE/../guard" ]]; then
+  GUARD="$HERE/../guard"
+fi
 
 "$HERE/claude-quota-probe" >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] && { log "probe rc=$rc; $(wc -l < "$QUEUE" | tr -d ' ') queued, waiting"; exit 0; }
@@ -49,6 +61,15 @@ while IFS= read -r line; do
   (( now - ts > MAX_AGE )) && { log "$sid: older than ${MAX_AGE}s, dropped"; continue; }
   tr_path="$(transcript_of "$sid" "$cwd")"
   if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
+  if [[ -n "$GUARD" ]]; then
+    guard_out="$("$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
+    if (( guard_rc == 0 )); then
+      guard_msg="$(head -n 1 <<<"$guard_out")"
+      log "$sid: guard says live elsewhere ($guard_msg), re-queued"
+      echo "$line" >> "$QUEUE"
+      continue
+    fi
+  fi
   [[ -d "$cwd" ]] || cwd="$HOME"
   n="$(bump_attempts "$sid")"
   if (( n > MAX_ATTEMPTS )); then log "$sid: attempt $n exceeds $MAX_ATTEMPTS, dropped"; notify "Session ${sid:0:8} gave up after $MAX_ATTEMPTS resumes"; continue; fi
