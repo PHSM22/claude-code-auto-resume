@@ -15,7 +15,7 @@
 #      entry re-queued, no resume call
 #   9. CLAUDE_RESUME_GUARD_TIMEOUT=99999999999 -> invalid, falls back to 30,
 #      immediate-exit guard, run completes bounded
-#  10. guard exits just before the deadline (sleep 0.9, timeout 1) -> NOT a
+#  10. guard exits just before the deadline (sleep 1.2, timeout 2) -> NOT a
 #      timeout: exit 0 re-queues (live), exit 1 resumes (not live)
 #  11. guard outlives the deadline (sleep 3, timeout 1) -> timeout branch,
 #      resume proceeds
@@ -182,8 +182,8 @@ grep -q -- "--resume" "$CALLS" && pass "case 9: --resume call happened" || fail 
 # The post-exit group kill takes ~0.2s past waitpid; the exit code must still
 # report what the guard did, never 124.
 fresh_case 10a
-printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 0.9; exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
-export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 1.2; exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=2
 start=$SECONDS
 "$HERE/bin/claude-auto-resume"
 elapsed=$(( SECONDS - start ))
@@ -194,8 +194,8 @@ grep -q "live elsewhere" "$LOG" 2>/dev/null && pass "case 10a: log says live els
 (( elapsed < 4 )) && pass "case 10a: bounded in ${elapsed}s (< 4s)" || fail "case 10a: took ${elapsed}s"
 
 fresh_case 10b
-printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 0.9; exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
-export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 1.2; exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=2
 start=$SECONDS
 "$HERE/bin/claude-auto-resume"
 elapsed=$(( SECONDS - start ))
