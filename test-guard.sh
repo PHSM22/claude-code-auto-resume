@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-guard.sh — hermetic tests for the resume guard in bin/claude-auto-resume.
 # No real `claude`, no network: a fake `claude` on PATH prints OK (no
-# rate-limit words, so the probe passes) and records every call. Six cases:
+# rate-limit words, so the probe passes) and records every call. Eleven cases:
 #   1. guard exits 0 (live elsewhere) -> re-queued untouched, no resume call
 #   2. guard exits 1 (not live)       -> resume call happens, queue empty
 #   3. CLAUDE_RESUME_GUARD unset, default $HERE/../guard absent -> same as 2
@@ -15,6 +15,10 @@
 #      entry re-queued, no resume call
 #   9. CLAUDE_RESUME_GUARD_TIMEOUT=99999999999 -> invalid, falls back to 30,
 #      immediate-exit guard, run completes bounded
+#  10. guard exits just before the deadline (sleep 0.9, timeout 1) -> NOT a
+#      timeout: exit 0 re-queues (live), exit 1 resumes (not live)
+#  11. guard outlives the deadline (sleep 3, timeout 1) -> timeout branch,
+#      resume proceeds
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PASS=0; FAIL=0
@@ -173,6 +177,44 @@ grep -q 'guard timeout "99999999999" invalid, using 30' "$LOG" 2>/dev/null && pa
 grep -q -- "--resume" "$CALLS" && pass "case 9: --resume call happened" || fail "case 9: no --resume call: $(cat "$CALLS" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 9: queue empty" || fail "case 9: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 (( elapsed < 10 )) && pass "case 9: bounded in ${elapsed}s" || fail "case 9: took ${elapsed}s"
+
+# --- Case 10: guard exits just before the deadline -> NOT a timeout ---
+# The post-exit group kill takes ~0.2s past waitpid; the exit code must still
+# report what the guard did, never 124.
+fresh_case 10a
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 0.9; exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+diff <(echo "$LINE") "$QUEUE" >/dev/null && pass "case 10a: queue still holds the line (live)" || fail "case 10a: queue changed: $(cat "$QUEUE" 2>/dev/null)"
+! grep -q -- "--resume" "$CALLS" && pass "case 10a: no --resume call" || fail "case 10a: resume ran despite live guard"
+grep -q "live elsewhere" "$LOG" 2>/dev/null && pass "case 10a: log says live elsewhere" || fail "case 10a: log missing 'live elsewhere': $(cat "$LOG" 2>/dev/null)"
+! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 10a: log has no timeout line" || fail "case 10a: misclassified as timeout: $(cat "$LOG" 2>/dev/null)"
+(( elapsed < 4 )) && pass "case 10a: bounded in ${elapsed}s (< 4s)" || fail "case 10a: took ${elapsed}s"
+
+fresh_case 10b
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 0.9; exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+grep -q -- "--resume" "$CALLS" && pass "case 10b: --resume call happened (proceed path)" || fail "case 10b: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 10b: queue empty" || fail "case 10b: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 10b: log has no timeout line" || fail "case 10b: misclassified as timeout: $(cat "$LOG" 2>/dev/null)"
+(( elapsed < 4 )) && pass "case 10b: bounded in ${elapsed}s (< 4s)" || fail "case 10b: took ${elapsed}s"
+
+# --- Case 11: guard outlives the deadline -> timeout branch, resume proceeds ---
+fresh_case 11
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 3; exit 0'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+grep -q -- "--resume" "$CALLS" && pass "case 11: --resume call happened despite hanging guard" || fail "case 11: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+grep -q "timed out" "$LOG" 2>/dev/null && pass "case 11: log says timed out" || fail "case 11: log missing 'timed out': $(cat "$LOG" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 11: queue empty" || fail "case 11: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+(( elapsed < CLAUDE_RESUME_GUARD_TIMEOUT + 3 )) && pass "case 11: bounded in ${elapsed}s (< $(( CLAUDE_RESUME_GUARD_TIMEOUT + 3 ))s)" || fail "case 11: took ${elapsed}s, exceeded timeout + 3s"
 
 echo "---"
 echo "$PASS passed, $FAIL failed"

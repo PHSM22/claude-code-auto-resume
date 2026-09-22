@@ -77,18 +77,21 @@ while IFS= read -r line; do
       # past the deadline. The group kill runs on EVERY exit path: on timeout
       # (ALRM handler) and after the guard exits however it exits, because a
       # backgrounded descendant outlives a normally-exiting guard and holds
-      # the pipe just the same. The alarm stays armed until the kill has
-      # happened. Timeout exits 124 (coreutils convention); a guard must
-      # therefore never exit 124 itself.
+      # the pipe just the same. The instant waitpid returns the status is
+      # recorded and the alarm disarmed BEFORE the post-exit group kill, so
+      # the exit code reports what the guard did and the cleanup that
+      # follows can never reclassify it as a timeout. Timeout exits 124
+      # (coreutils convention); a guard must therefore never exit 124 itself.
       guard_out="$(perl -e '
         use POSIX qw(WNOHANG);
         my $t = shift @ARGV; my $pid = fork;
         if (!defined $pid) { exit 127 }
         if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
+        my $done = 0; my $rc = 0;
         sub killtree { kill "TERM", -$pid; select(undef,undef,undef,0.2); kill "KILL", -$pid; while (waitpid(-1, WNOHANG) > 0) {} }
-        $SIG{ALRM} = sub { killtree(); exit 124 };
-        alarm $t; waitpid($pid, 0); my $rc = $?;
-        killtree(); alarm 0;
+        $SIG{ALRM} = sub { return if $done; killtree(); exit 124 };
+        alarm $t; waitpid($pid, 0); $rc = $?; $done = 1; alarm 0;
+        killtree();
         exit(($rc >> 8) || ($rc & 127 ? 128 + ($rc & 127) : 0));
       ' "$GUARD_TIMEOUT" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
       if (( guard_rc == 124 )); then
