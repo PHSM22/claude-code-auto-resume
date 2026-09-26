@@ -37,6 +37,16 @@ CLAUDE_TEST_MODEL=claude-sonnet-5 ./test.sh # or pin one
 
 A session you already continued by hand is skipped (its transcript changed after it was queued). A session that hits the limit again mid-resume is re-queued, at most `CLAUDE_RESUME_MAX_ATTEMPTS` times. Unrecoverable sessions (context too long, model no longer supported) are dropped with a notification. Entries older than 24h are dropped.
 
+## Guard: don't resume a session that is live elsewhere
+
+Resuming a session headlessly while it is already open and being driven in the Desktop app makes two writers fight over one session, so the resumer can ask an optional guard executable first. The guard is called as `guard <session-id> <cwd>`: exit 0 means "live elsewhere" and the entry is re-queued untouched (no attempt consumed) with a `guard says live elsewhere (<first line of guard output>), re-queued` log line, while any other exit resumes as usual. Configure it with `CLAUDE_RESUME_GUARD` (path to your executable), or drop an executable named `guard` next to `bin/` (`$PREFIX/guard` once installed); a configured guard that is not executable is logged once and ignored. A guard must never itself exit 124 — that code is reserved for timeouts (the coreutils convention).
+
+The guard call is always bounded, or it is never made:
+
+- Every guard invocation runs under a `CLAUDE_RESUME_GUARD_TIMEOUT` (default `30` seconds) supervisor that puts the guard in its own process group and kills the whole group (TERM, then KILL) on expiry, so even a guard that forks a child holding stdout cannot stall the resumer. A guard that does not answer in time is treated as "not live" (the resume proceeds) with a `<sid>: guard timed out after <N>s, treated as not live` log line.
+- A `CLAUDE_RESUME_GUARD_TIMEOUT` that is not an integer in `[1, 3600]` is rejected with a `guard timeout "<value>" invalid, using 30` log line and 30 is used.
+- The supervisor needs `perl`. Without it the guard is not called at all: a `guard skipped: perl not found, cannot bound the call` line is logged and the resume proceeds. The guard is never run unbounded.
+
 ## Configuration (environment variables, set in the scheduler unit or before running by hand)
 
 | Variable | Default | Meaning |
@@ -45,6 +55,9 @@ A session you already continued by hand is skipped (its transcript changed after
 | `CLAUDE_RESUME_MAX_ATTEMPTS` | `2` | Resumes per session before it is dropped with a notification. |
 | `CLAUDE_RESUME_PROMPT` | "Quota is back… continue where you left off…" | The message the resumed session receives. |
 | `CLAUDE_RESUME_MAX_AGE` | `86400` | Seconds after which a queued session is dropped. |
+| `CLAUDE_RESUME_GUARD` | unset | Path to the optional live-session guard executable (or `$PREFIX/guard` by default). Requires `perl` so the call can be bounded; without it the guard is skipped. |
+| `CLAUDE_RESUME_GUARD_TIMEOUT` | `30` | Seconds bounding each guard call (whole process tree killed on expiry, treated as not live). Must be an integer in `[1, 3600]`; anything else falls back to 30. |
+| `CLAUDE_RESUME_GUARD_CLEANUP_S` | `0.2` | Test/diagnostic knob: seconds between TERM and KILL when cleaning up the guard's process group. Must be a number in `[0, 10]`; anything else falls back to 0.2. |
 | `CLAUDE_PROBE_MODEL` | CLI default | Model for the probe request. |
 | `CLAUDE_RATE_LIMIT_RE` | see scripts | Regex that identifies a usage-limit message. |
 | `CLAUDE_RESUME_QUEUE`, `CLAUDE_RESUME_DIR` | under `~/.claude/cache` | Paths. |

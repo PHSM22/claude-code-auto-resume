@@ -16,6 +16,8 @@ PERM="${CLAUDE_RESUME_PERMISSION:-dontAsk}"
 MAX_ATTEMPTS="${CLAUDE_RESUME_MAX_ATTEMPTS:-2}"
 ATTEMPTS="$OUT/attempts.json"
 MAX_AGE="${CLAUDE_RESUME_MAX_AGE:-86400}"
+GUARD_TIMEOUT="${CLAUDE_RESUME_GUARD_TIMEOUT:-30}"
+CLEANUP_S="${CLAUDE_RESUME_GUARD_CLEANUP_S:-0.2}"
 PROMPT="${CLAUDE_RESUME_PROMPT:-Quota is back after a usage limit interrupted this session. Continue where you left off. Re-run any background agent or command that failed with a session/usage limit. When done, summarise what was completed.}"
 RL_RE="${CLAUDE_RATE_LIMIT_RE:-429|cooling down|usage limit|rate.?limit|resets at|session limit}"
 TERMINAL_RE="${CLAUDE_TERMINAL_RE:-Prompt is too long|does not support this model|No conversation found}"
@@ -27,6 +29,33 @@ trap 'rmdir "$LOCK"' EXIT
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 notify() { command -v osascript >/dev/null && osascript -e "display notification \"$1\" with title \"Claude auto-resume\"" >/dev/null 2>&1; command -v notify-send >/dev/null && notify-send "Claude auto-resume" "$1"; true; }
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+# A non-integer timeout, or one outside 1..3600, would silently disable the
+# alarm below (alarm 0 cancels it) or overflow perl's alarm into a negative
+# (unbounded) wait, so reject it and fall back to 30.
+if ! [[ "$GUARD_TIMEOUT" =~ ^[0-9]+$ ]] || (( ${#GUARD_TIMEOUT} > 10 || 10#$GUARD_TIMEOUT < 1 || 10#$GUARD_TIMEOUT > 3600 )); then
+  log "guard timeout \"$GUARD_TIMEOUT\" invalid, using 30"
+  GUARD_TIMEOUT=30
+fi
+# Post-exit cleanup pause between the TERM and KILL of the guard's process
+# group. A number in [0, 10] seconds; anything else falls back to 0.2. This
+# is a test/diagnostic knob: stretching it opens the race window in which a
+# late alarm would reclassify a decided exit as a timeout.
+if ! [[ "$CLEANUP_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! python3 -c 'import sys; v=float(sys.argv[1]); sys.exit(0 if 0 <= v <= 10 else 1)' "$CLEANUP_S" 2>/dev/null; then
+  log "guard cleanup \"$CLEANUP_S\" invalid, using 0.2"
+  CLEANUP_S=0.2
+fi
+# Optional guard: answers "is this session live elsewhere?" so a headless
+# resume never races a session already being driven in the desktop app.
+GUARD=""
+if [[ -n "${CLAUDE_RESUME_GUARD:-}" ]]; then
+  if [[ -x "$CLAUDE_RESUME_GUARD" ]]; then
+    GUARD="$CLAUDE_RESUME_GUARD"
+  else
+    log "guard $CLAUDE_RESUME_GUARD not executable, ignored"
+  fi
+elif [[ -x "$HERE/../guard" ]]; then
+  GUARD="$HERE/../guard"
+fi
 
 "$HERE/claude-quota-probe" >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] && { log "probe rc=$rc; $(wc -l < "$QUEUE" | tr -d ' ') queued, waiting"; exit 0; }
@@ -49,6 +78,75 @@ while IFS= read -r line; do
   (( now - ts > MAX_AGE )) && { log "$sid: older than ${MAX_AGE}s, dropped"; continue; }
   tr_path="$(transcript_of "$sid" "$cwd")"
   if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
+  if [[ -n "$GUARD" ]]; then
+    if command -v perl >/dev/null 2>&1; then
+      # Redirect guard output to a file: an escaped descendant may keep its
+      # descriptor open, but it cannot keep this supervisor's stdout pipe
+      # open. The group kill also cleans up descendants that stay in the
+      # guard's process group. The alarm handler must preserve wait status so
+      # a late alarm cannot turn an already-completed guard into a timeout.
+      if guard_output="$(mktemp "$OUT/.guard-output.XXXXXX" 2>/dev/null)"; then
+        perl -e '
+          use POSIX qw(WNOHANG);
+          my $t = shift @ARGV; my $cs = shift @ARGV; my $out = shift @ARGV; my $pid = fork;
+          if (!defined $pid) { exit 127 }
+          if (!$pid) {
+            setpgrp(0, 0);
+            open my $out_fh, ">", $out or exit 127;
+            open STDOUT, ">&", $out_fh or exit 127;
+            open STDERR, ">&", $out_fh or exit 127;
+            close $out_fh;
+            exec @ARGV or exit 127;
+          }
+          my ($fired, $waited, $timeout_cleanup) = (0, 0, 0);
+          my ($sent_term, $sent_kill) = (0, 0);
+          sub signal_group {
+            my ($for_timeout) = @_;
+            my $term_count = kill "TERM", -$pid;
+            $sent_term = 1 if $for_timeout && $term_count;
+            select(undef,undef,undef,$cs);
+            my $kill_count = kill "KILL", -$pid;
+            $sent_kill = 1 if $for_timeout && $kill_count;
+          }
+          $SIG{ALRM} = sub {
+            local ($?, $!);
+            $fired = 1;
+            unless ($waited) { $timeout_cleanup = 1; signal_group(1); }
+          };
+          alarm $t;
+          my $r; do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
+          $waited = ($r == $pid);
+          my $st = $?;
+          alarm 0;
+          signal_group(0) unless $timeout_cleanup;
+          while (waitpid(-1, WNOHANG) > 0) {}
+          if (($st & 127) == 0) { exit($st >> 8) }
+          my $sig = $st & 127;
+          if ($fired && (($sig == 15 && $sent_term) || ($sig == 9 && $sent_kill))) { exit 124 }
+          exit(128 + $sig);
+        ' "$GUARD_TIMEOUT" "$CLEANUP_S" "$guard_output" "$GUARD" "$sid" "$cwd" >/dev/null 2>&1
+        guard_rc=$?
+        guard_out="$(head -c 4096 "$guard_output" 2>/dev/null)"
+        rm -f "$guard_output"
+        if (( guard_rc == 124 )); then
+          log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"
+        elif (( guard_rc == 0 )); then
+          guard_msg="$(head -n 1 <<<"$guard_out")"
+          log "$sid: guard says live elsewhere ($guard_msg), re-queued"
+          echo "$line" >> "$QUEUE"
+          continue
+        else
+          log "$sid: guard rc=$guard_rc, treated as not live"
+        fi
+      else
+        log "$sid: guard skipped: could not create temporary output file"
+      fi
+    else
+      # Without perl there is no way to bound the call, so the guard is not
+      # called at all and the resume proceeds. Never run it unbounded.
+      log "guard skipped: perl not found, cannot bound the call"
+    fi
+  fi
   [[ -d "$cwd" ]] || cwd="$HOME"
   n="$(bump_attempts "$sid")"
   if (( n > MAX_ATTEMPTS )); then log "$sid: attempt $n exceeds $MAX_ATTEMPTS, dropped"; notify "Session ${sid:0:8} gave up after $MAX_ATTEMPTS resumes"; continue; fi

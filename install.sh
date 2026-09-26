@@ -35,6 +35,7 @@ fi
 command -v claude >/dev/null || { echo "claude CLI not on PATH" >&2; exit 1; }
 mkdir -p "$PREFIX" "$HOME/.claude/cache/resumed"
 cp -R "$SRC/bin" "$SRC/hooks" "$PREFIX/"; chmod +x "$PREFIX"/bin/* "$PREFIX"/hooks/*.py
+# a guard executable at $PREFIX/guard is optional and owner-provided; see README
 hook_settings add
 sub() { sed -e "s#__PREFIX__#$PREFIX#g" -e "s#__HOME__#$HOME#g" -e "s#__PATH__#$PATHV#g" "$1"; }
 if [[ "$(uname)" == Darwin ]]; then
