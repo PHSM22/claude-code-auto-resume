@@ -86,22 +86,34 @@ while IFS= read -r line; do
       # past the deadline. The group kill runs on EVERY exit path: on timeout
       # (ALRM handler) and after the guard exits however it exits, because a
       # backgrounded descendant outlives a normally-exiting guard and holds
-      # the pipe just the same. The instant waitpid returns the status is
-      # recorded and the alarm disarmed BEFORE the post-exit group kill, so
-      # the exit code reports what the guard did and the cleanup that
-      # follows can never reclassify it as a timeout. Timeout exits 124
+      # the pipe just the same. Rule: nothing the ALRM handler does may
+      # change any state the main path reads after waitpid — not $?, not
+      # $!, not the child's reapability — so the answer stays a pure
+      # function of the child's wait status. The handler therefore only
+      # signals the group (TERM, pause, KILL) and sets a flag; it never
+      # reaps. Reaping happens on the main path after the status is
+      # captured. If the guard exited on its own (WIFEXITED) its exit code
+      # wins, whenever the alarm fired; if it died from the supervisor's
+      # own group kill (WIFSIGNALED with TERM/KILL after the alarm fired)
+      # it is a timeout, 124. Timeout exits 124
       # (coreutils convention); a guard must therefore never exit 124 itself.
       guard_out="$(perl -e '
         use POSIX qw(WNOHANG);
         my $t = shift @ARGV; my $cs = shift @ARGV; my $pid = fork;
         if (!defined $pid) { exit 127 }
         if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
-        my $done = 0; my $rc = 0;
-        sub killtree { kill "TERM", -$pid; select(undef,undef,undef,$cs); kill "KILL", -$pid; while (waitpid(-1, WNOHANG) > 0) {} }
-        $SIG{ALRM} = sub { return if $done; killtree(); exit 124 };
-        alarm $t; waitpid($pid, 0); $rc = $?; $done = 1; alarm 0;
-        killtree();
-        exit(($rc >> 8) || ($rc & 127 ? 128 + ($rc & 127) : 0));
+        my $fired = 0;
+        sub signal_group { kill "TERM", -$pid; select(undef,undef,undef,$cs); kill "KILL", -$pid; }
+        $SIG{ALRM} = sub { local ($?, $!); $fired = 1; signal_group(); };
+        alarm $t;
+        my $r; do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
+        my $st = $?;
+        alarm 0;
+        signal_group();
+        while (waitpid(-1, WNOHANG) > 0) {}
+        if (($st & 127) == 0) { exit($st >> 8) }
+        if ($fired) { exit 124 }
+        exit(128 + ($st & 127));
       ' "$GUARD_TIMEOUT" "$CLEANUP_S" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
       if (( guard_rc == 124 )); then
         log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"

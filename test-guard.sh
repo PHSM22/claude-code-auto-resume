@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-guard.sh — hermetic tests for the resume guard in bin/claude-auto-resume.
 # No real `claude`, no network: a fake `claude` on PATH prints OK (no
-# rate-limit words, so the probe passes) and records every call. Eleven cases:
+# rate-limit words, so the probe passes) and records every call. Twelve cases:
 #   1. guard exits 0 (live elsewhere) -> re-queued untouched, no resume call
 #   2. guard exits 1 (not live)       -> resume call happens, queue empty
 #   3. CLAUDE_RESUME_GUARD unset, default $HERE/../guard absent -> same as 2
@@ -21,8 +21,11 @@
 #      with the broken ordering (alarm still armed during cleanup) the alarm
 #      fires mid-cleanup and misreports the exit as 124; with the fix the
 #      alarm is disarmed first and the guard's own status wins.
-#  11. guard outlives the deadline (sleep 3, timeout 1) -> timeout branch,
-#      resume proceeds
+#  11. guard outlives the deadline (sleep 3, timeout 1, would exit 0) ->
+#      timeout branch (124 path), resume proceeds
+#  12. same deadline overrun (sleep 3, timeout 1, would exit 1) -> still the
+#      124 path: a timeout reports 124 no matter what the guard would have
+#      answered, resume proceeds
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PASS=0; FAIL=0
@@ -85,6 +88,7 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$T/guard"; chmod +x "$T/guard"
 export CLAUDE_RESUME_GUARD="$T/guard"
 "$HERE/bin/claude-auto-resume"
 grep -q -- "--resume" "$CALLS" && pass "case 2: --resume call happened" || fail "case 2: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+n2="$(grep -c -- "--resume" "$CALLS" || true)"; [[ "$n2" -eq 1 ]] && pass "case 2: exactly one --resume call" || fail "case 2: --resume count=$n2: $(cat "$CALLS" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 2: queue empty" || fail "case 2: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 
 # --- Case 3: default path — CLAUDE_RESUME_GUARD unset, $HERE/../guard absent ---
@@ -93,6 +97,7 @@ cp "$HERE"/bin/* "$T/bin/"
 [[ ! -e "$T/guard" ]] && pass "case 3: default guard path provably absent" || fail "case 3: $T/guard unexpectedly exists"
 "$T/bin/claude-auto-resume"
 grep -q -- "--resume" "$CALLS" && pass "case 3: --resume call happened" || fail "case 3: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+n3="$(grep -c -- "--resume" "$CALLS" || true)"; [[ "$n3" -eq 1 ]] && pass "case 3: exactly one --resume call" || fail "case 3: --resume count=$n3: $(cat "$CALLS" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 3: queue empty" || fail "case 3: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 ! grep -q "guard" "$LOG" 2>/dev/null && pass "case 3: log has no guard lines" || fail "case 3: unexpected guard log: $(cat "$LOG" 2>/dev/null)"
 
@@ -222,6 +227,18 @@ grep -q -- "--resume" "$CALLS" && pass "case 11: --resume call happened despite 
 grep -q "timed out" "$LOG" 2>/dev/null && pass "case 11: log says timed out" || fail "case 11: log missing 'timed out': $(cat "$LOG" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 11: queue empty" || fail "case 11: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 (( elapsed < CLAUDE_RESUME_GUARD_TIMEOUT + 3 )) && pass "case 11: bounded in ${elapsed}s (< $(( CLAUDE_RESUME_GUARD_TIMEOUT + 3 ))s)" || fail "case 11: took ${elapsed}s, exceeded timeout + 3s"
+
+# --- Case 12: same deadline overrun, guard would exit 1 -> still the 124 path ---
+fresh_case 12
+printf '#!/usr/bin/env bash\nsh -c '"'"'sleep 3; exit 1'"'"'\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+start=$SECONDS
+"$HERE/bin/claude-auto-resume"
+elapsed=$(( SECONDS - start ))
+grep -q -- "--resume" "$CALLS" && pass "case 12: --resume call happened despite hanging guard" || fail "case 12: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+grep -q "timed out" "$LOG" 2>/dev/null && pass "case 12: log says timed out" || fail "case 12: log missing 'timed out': $(cat "$LOG" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 12: queue empty" || fail "case 12: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+(( elapsed < CLAUDE_RESUME_GUARD_TIMEOUT + 3 )) && pass "case 12: bounded in ${elapsed}s (< $(( CLAUDE_RESUME_GUARD_TIMEOUT + 3 ))s)" || fail "case 12: took ${elapsed}s, exceeded timeout + 3s"
 
 echo "---"
 echo "$PASS passed, $FAIL failed"
