@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # test-guard.sh — hermetic tests for the resume guard in bin/claude-auto-resume.
 # No real `claude`, no network: a fake `claude` on PATH prints OK (no
-# rate-limit words, so the probe passes) and records every call. Twelve cases:
+# rate-limit words, so the probe passes) and records every call. Fifteen cases:
 #   1. guard exits 0 (live elsewhere) -> re-queued untouched, no resume call
 #   2. guard exits 1 (not live)       -> resume call happens, queue empty
 #   3. CLAUDE_RESUME_GUARD unset, default $HERE/../guard absent -> same as 2
-#   4. guard forks a child holding stdout and hangs -> process-group kill
-#      bounds the whole resumer to timeout + 3s, resume happens
+#   4. guard forks a child holding its output descriptor and hangs ->
+#      process-group kill bounds the resumer, resume happens
 #   5. CLAUDE_RESUME_GUARD_TIMEOUT=bogus -> invalid, falls back to 30, resume happens
 #   6. no perl on PATH -> guard skipped, never called, resume happens
-#   7. guard exits 1 at once but backgrounds `sleep 8` holding stdout ->
-#      post-exit group kill closes the pipe, resumer bounded (< 4s), resume happens
+#   7. guard exits 1 at once but backgrounds `sleep 8` holding its output
+#      descriptor -> resumer bounded (< 4s), resume happens
 #   8. same backgrounded child, guard exits 0 (live) -> still bounded (< 4s),
 #      entry re-queued, no resume call
 #   9. CLAUDE_RESUME_GUARD_TIMEOUT=99999999999 -> invalid, falls back to 30,
@@ -26,6 +26,11 @@
 #  12. same deadline overrun (sleep 3, timeout 1, would exit 1) -> still the
 #      124 path: a timeout reports 124 no matter what the guard would have
 #      answered, resume proceeds
+#  13. delayed wait-status capture after an exit-0 guard -> alarm race keeps
+#      the captured child status, live entry is re-queued
+#  14. guard exits 1 after starting a setsid sleeper with inherited output ->
+#      escaped descriptor cannot hold the resumer, resume happens, sleeper killed
+#  15. guard kills itself with SIGUSR1 -> signal exit is logged, not timed out
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PASS=0; FAIL=0
@@ -239,6 +244,91 @@ grep -q -- "--resume" "$CALLS" && pass "case 12: --resume call happened despite 
 grep -q "timed out" "$LOG" 2>/dev/null && pass "case 12: log says timed out" || fail "case 12: log missing 'timed out': $(cat "$LOG" 2>/dev/null)"
 [[ ! -s "$QUEUE" ]] && pass "case 12: queue empty" || fail "case 12: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
 (( elapsed < CLAUDE_RESUME_GUARD_TIMEOUT + 3 )) && pass "case 12: bounded in ${elapsed}s (< $(( CLAUDE_RESUME_GUARD_TIMEOUT + 3 ))s)" || fail "case 12: took ${elapsed}s, exceeded timeout + 3s"
+
+# --- Case 13: alarm fires between waitpid and status capture -> preserve exit 0 ---
+fresh_case 13
+mkdir -p "$T/copy/bin"
+cp -p "$HERE/bin/claude-auto-resume" "$HERE/bin/claude-quota-probe" "$T/copy/bin/"
+copy_resume="$T/copy/bin/claude-auto-resume"
+anchor_count="$(grep -c '^          my \$st = \$?;$' "$copy_resume" || true)"
+[[ "$anchor_count" -eq 1 ]] && pass "case 13: status-capture anchor matched once" || fail "case 13: expected one status-capture anchor, got $anchor_count"
+sed '/^          my \$st = \$?;$/i\
+          select(undef,undef,undef,2);
+' "$copy_resume" > "$copy_resume.patched"
+insert_count="$(grep -c '^          select(undef,undef,undef,2);$' "$copy_resume.patched" || true)"
+[[ "$insert_count" -eq 1 ]] && pass "case 13: wait/status delay inserted once" || fail "case 13: expected one inserted delay, got $insert_count"
+mv "$copy_resume.patched" "$copy_resume"
+cat > "$T/guard" <<'EOF'
+#!/usr/bin/env bash
+exec sh -c 'sleep 0.3; exit 0'
+EOF
+chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1
+"$copy_resume"
+grep -q "live elsewhere" "$LOG" 2>/dev/null && pass "case 13: log says live elsewhere" || fail "case 13: missing live-elsewhere line: $(cat "$LOG" 2>/dev/null)"
+! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 13: no timeout line" || fail "case 13: misclassified as timed out: $(cat "$LOG" 2>/dev/null)"
+diff <(echo "$LINE") "$QUEUE" >/dev/null && pass "case 13: queue entry re-queued" || fail "case 13: queue changed: $(cat "$QUEUE" 2>/dev/null)"
+! grep -q -- "--resume" "$CALLS" && pass "case 13: no --resume call" || fail "case 13: resume ran despite live guard"
+
+# --- Case 14: a setsid descendant keeps output open but cannot hold the resumer ---
+fresh_case 14
+CASE14_PID_FILE="$T/stray.pid"
+if command -v setsid >/dev/null 2>&1; then
+  cat > "$T/guard" <<EOF
+#!/usr/bin/env bash
+setsid sh -c 'echo \$\$ > "$CASE14_PID_FILE"; exec sleep 5' &
+exit 1
+EOF
+else
+  cat > "$T/guard" <<EOF
+#!/usr/bin/env perl
+use POSIX qw(setsid);
+my \$pid = fork();
+defined \$pid or die "fork failed: \$!";
+if (!\$pid) {
+  setsid() >= 0 or die "setsid failed: \$!";
+  exec "sh", "-c", 'echo \$\$ > "\$1"; exec sleep 5', "stray", "$CASE14_PID_FILE";
+  die "exec failed: \$!";
+}
+exit 1;
+EOF
+fi
+chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=1 CLAUDE_RESUME_GUARD_CLEANUP_S=0.2
+cleanup_case14_stray() {
+  [[ -s "$CASE14_PID_FILE" ]] || return 0
+  stray_pid="$(cat "$CASE14_PID_FILE" 2>/dev/null)"
+  if [[ "$stray_pid" =~ ^[0-9]+$ ]] && (( stray_pid > 1 )); then
+    kill "$stray_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup_case14_stray EXIT
+t0="$(python3 -c 'import time; print(time.monotonic())')"
+"$HERE/bin/claude-auto-resume"
+elapsed="$(python3 -c "import time; print(time.monotonic() - $t0)")"
+grep -q -- "--resume" "$CALLS" && pass "case 14: --resume call happened" || fail "case 14: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+[[ ! -s "$QUEUE" ]] && pass "case 14: queue empty" || fail "case 14: queue not empty: $(cat "$QUEUE" 2>/dev/null)"
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 3 else 1)' "$elapsed" && pass "case 14: resumer finished in ${elapsed}s (< 3s)" || fail "case 14: resumer took ${elapsed}s"
+i=0
+while [[ ! -s "$CASE14_PID_FILE" && "$i" -lt 20 ]]; do sleep 0.05; i=$((i + 1)); done
+[[ -s "$CASE14_PID_FILE" ]] && pass "case 14: escaped sleeper PID recorded for cleanup" || fail "case 14: escaped sleeper PID was not recorded"
+cleanup_case14_stray
+trap - EXIT
+
+# --- Case 15: a self-sent signal keeps its signal exit code, not timeout 124 ---
+fresh_case 15
+printf '#!/usr/bin/env bash\nkill -USR1 "$$"\n' > "$T/guard"; chmod +x "$T/guard"
+export CLAUDE_RESUME_GUARD="$T/guard" CLAUDE_RESUME_GUARD_TIMEOUT=30
+"$HERE/bin/claude-auto-resume"
+usr1_sig="$(kill -l USR1)"
+if [[ "$usr1_sig" =~ ^[0-9]+$ ]]; then
+  usr1_rc=$((128 + usr1_sig))
+  grep -q "guard rc=$usr1_rc, treated as not live" "$LOG" 2>/dev/null && pass "case 15: log records signal exit rc=$usr1_rc" || fail "case 15: missing signal-exit line: $(cat "$LOG" 2>/dev/null)"
+else
+  fail "case 15: kill -l USR1 did not return a signal number: $usr1_sig"
+fi
+! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 15: no timeout line" || fail "case 15: misclassified as timed out: $(cat "$LOG" 2>/dev/null)"
+grep -q -- "--resume" "$CALLS" && pass "case 15: resume proceeded" || fail "case 15: no --resume call: $(cat "$CALLS" 2>/dev/null)"
 
 echo "---"
 echo "$PASS passed, $FAIL failed"

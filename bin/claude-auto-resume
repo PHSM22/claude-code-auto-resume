@@ -80,48 +80,66 @@ while IFS= read -r line; do
   if [[ -f "$tr_path" ]] && (( $(mtime "$tr_path") > ts + 60 )); then log "$sid: transcript changed after queueing, already continued, skipped"; continue; fi
   if [[ -n "$GUARD" ]]; then
     if command -v perl >/dev/null 2>&1; then
-      # Bounded supervisor: the guard runs in its own process group so that
-      # the whole tree dies — killing only the guard itself would leave a
-      # forked child holding the captured stdout pipe and keep $(...) open
-      # past the deadline. The group kill runs on EVERY exit path: on timeout
-      # (ALRM handler) and after the guard exits however it exits, because a
-      # backgrounded descendant outlives a normally-exiting guard and holds
-      # the pipe just the same. Rule: nothing the ALRM handler does may
-      # change any state the main path reads after waitpid — not $?, not
-      # $!, not the child's reapability — so the answer stays a pure
-      # function of the child's wait status. The handler therefore only
-      # signals the group (TERM, pause, KILL) and sets a flag; it never
-      # reaps. Reaping happens on the main path after the status is
-      # captured. If the guard exited on its own (WIFEXITED) its exit code
-      # wins, whenever the alarm fired; if it died from the supervisor's
-      # own group kill (WIFSIGNALED with TERM/KILL after the alarm fired)
-      # it is a timeout, 124. Timeout exits 124
-      # (coreutils convention); a guard must therefore never exit 124 itself.
-      guard_out="$(perl -e '
-        use POSIX qw(WNOHANG);
-        my $t = shift @ARGV; my $cs = shift @ARGV; my $pid = fork;
-        if (!defined $pid) { exit 127 }
-        if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
-        my $fired = 0;
-        sub signal_group { kill "TERM", -$pid; select(undef,undef,undef,$cs); kill "KILL", -$pid; }
-        $SIG{ALRM} = sub { local ($?, $!); $fired = 1; signal_group(); };
-        alarm $t;
-        my $r; do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
-        my $st = $?;
-        alarm 0;
-        signal_group();
-        while (waitpid(-1, WNOHANG) > 0) {}
-        if (($st & 127) == 0) { exit($st >> 8) }
-        if ($fired) { exit 124 }
-        exit(128 + ($st & 127));
-      ' "$GUARD_TIMEOUT" "$CLEANUP_S" "$GUARD" "$sid" "$cwd" 2>&1)"; guard_rc=$?
-      if (( guard_rc == 124 )); then
-        log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"
-      elif (( guard_rc == 0 )); then
-        guard_msg="$(head -n 1 <<<"$guard_out")"
-        log "$sid: guard says live elsewhere ($guard_msg), re-queued"
-        echo "$line" >> "$QUEUE"
-        continue
+      # Redirect guard output to a file: an escaped descendant may keep its
+      # descriptor open, but it cannot keep this supervisor's stdout pipe
+      # open. The group kill also cleans up descendants that stay in the
+      # guard's process group. The alarm handler must preserve wait status so
+      # a late alarm cannot turn an already-completed guard into a timeout.
+      if guard_output="$(mktemp "$OUT/.guard-output.XXXXXX" 2>/dev/null)"; then
+        perl -e '
+          use POSIX qw(WNOHANG);
+          my $t = shift @ARGV; my $cs = shift @ARGV; my $out = shift @ARGV; my $pid = fork;
+          if (!defined $pid) { exit 127 }
+          if (!$pid) {
+            setpgrp(0, 0);
+            open my $out_fh, ">", $out or exit 127;
+            open STDOUT, ">&", $out_fh or exit 127;
+            open STDERR, ">&", $out_fh or exit 127;
+            close $out_fh;
+            exec @ARGV or exit 127;
+          }
+          my ($fired, $waited, $timeout_cleanup) = (0, 0, 0);
+          my ($sent_term, $sent_kill) = (0, 0);
+          sub signal_group {
+            my ($for_timeout) = @_;
+            my $term_count = kill "TERM", -$pid;
+            $sent_term = 1 if $for_timeout && $term_count;
+            select(undef,undef,undef,$cs);
+            my $kill_count = kill "KILL", -$pid;
+            $sent_kill = 1 if $for_timeout && $kill_count;
+          }
+          $SIG{ALRM} = sub {
+            local ($?, $!);
+            $fired = 1;
+            unless ($waited) { $timeout_cleanup = 1; signal_group(1); }
+          };
+          alarm $t;
+          my $r; do { $r = waitpid($pid, 0) } while ($r == -1 && $!{EINTR});
+          $waited = ($r == $pid);
+          my $st = $?;
+          alarm 0;
+          signal_group(0) unless $timeout_cleanup;
+          while (waitpid(-1, WNOHANG) > 0) {}
+          if (($st & 127) == 0) { exit($st >> 8) }
+          my $sig = $st & 127;
+          if ($fired && (($sig == 15 && $sent_term) || ($sig == 9 && $sent_kill))) { exit 124 }
+          exit(128 + $sig);
+        ' "$GUARD_TIMEOUT" "$CLEANUP_S" "$guard_output" "$GUARD" "$sid" "$cwd" >/dev/null 2>&1
+        guard_rc=$?
+        guard_out="$(head -c 4096 "$guard_output" 2>/dev/null)"
+        rm -f "$guard_output"
+        if (( guard_rc == 124 )); then
+          log "$sid: guard timed out after ${GUARD_TIMEOUT}s, treated as not live"
+        elif (( guard_rc == 0 )); then
+          guard_msg="$(head -n 1 <<<"$guard_out")"
+          log "$sid: guard says live elsewhere ($guard_msg), re-queued"
+          echo "$line" >> "$QUEUE"
+          continue
+        else
+          log "$sid: guard rc=$guard_rc, treated as not live"
+        fi
+      else
+        log "$sid: guard skipped: could not create temporary output file"
       fi
     else
       # Without perl there is no way to bound the call, so the guard is not
