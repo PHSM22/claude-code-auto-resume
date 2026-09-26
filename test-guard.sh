@@ -258,6 +258,7 @@ sed '/^          my \$st = \$?;$/i\
 insert_count="$(grep -c '^          select(undef,undef,undef,2);$' "$copy_resume.patched" || true)"
 [[ "$insert_count" -eq 1 ]] && pass "case 13: wait/status delay inserted once" || fail "case 13: expected one inserted delay, got $insert_count"
 mv "$copy_resume.patched" "$copy_resume"
+chmod +x "$copy_resume"
 cat > "$T/guard" <<'EOF'
 #!/usr/bin/env bash
 exec sh -c 'sleep 0.3; exit 0'
