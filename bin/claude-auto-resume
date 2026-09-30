@@ -60,7 +60,7 @@ fi
 "$HERE/claude-quota-probe" >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] && { log "probe rc=$rc; $(wc -l < "$QUEUE" | tr -d ' ') queued, waiting"; exit 0; }
 
-transcript_of() { local slug; slug="$(sed 's#[/.]#-#g' <<<"$2")"; echo "$HOME/.claude/projects/$slug/$1.jsonl"; }
+transcript_of() { local slug; slug="$(sed 's#[^A-Za-z0-9]#-#g' <<<"$2")"; echo "$HOME/.claude/projects/$slug/$1.jsonl"; }
 field() { python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get(sys.argv[2],""))' "$1" "$2"; }
 bump_attempts() {  # prints the new attempt count for session $1
   python3 -c 'import json,sys

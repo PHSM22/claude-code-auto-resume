@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-guard.sh — hermetic tests for the resume guard in bin/claude-auto-resume.
 # No real `claude`, no network: a fake `claude` on PATH prints OK (no
-# rate-limit words, so the probe passes) and records every call. Fifteen cases:
+# rate-limit words, so the probe passes) and records every call. Sixteen cases:
 #   1. guard exits 0 (live elsewhere) -> re-queued untouched, no resume call
 #   2. guard exits 1 (not live)       -> resume call happens, queue empty
 #   3. CLAUDE_RESUME_GUARD unset, default $HERE/../guard absent -> same as 2
@@ -31,6 +31,9 @@
 #  14. guard exits 1 after starting a setsid sleeper with inherited output ->
 #      escaped descriptor cannot hold the resumer, resume happens, sleeper killed
 #  15. guard kills itself with SIGUSR1 -> signal exit is logged, not timed out
+#  16. cwd containing `_` and a space, transcript touched after queueing ->
+#      skipped as already continued (Claude names the project dir by turning
+#      every non-alphanumeric character in the cwd into `-`), no resume call
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PASS=0; FAIL=0
@@ -330,6 +333,18 @@ else
 fi
 ! grep -q "timed out" "$LOG" 2>/dev/null && pass "case 15: no timeout line" || fail "case 15: misclassified as timed out: $(cat "$LOG" 2>/dev/null)"
 grep -q -- "--resume" "$CALLS" && pass "case 15: resume proceeded" || fail "case 15: no --resume call: $(cat "$CALLS" 2>/dev/null)"
+
+# --- Case 16: transcript lookup matches Claude's project dir for `_` and spaces in the cwd ---
+fresh_case 16
+CWD="$T/my_proj dir.d"; mkdir -p "$CWD"
+LINE="{\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"ts\":$(( $(date +%s) - 120 )),\"reason\":\"rate_limit\"}"
+echo "$LINE" > "$QUEUE"
+slug="$(sed 's#[^A-Za-z0-9]#-#g' <<<"$CWD")"
+mkdir -p "$HOME/.claude/projects/$slug"
+echo '{}' > "$HOME/.claude/projects/$slug/$SID.jsonl"   # mtime = now, after ts + 60
+"$HERE/bin/claude-auto-resume"
+grep -q "transcript changed after queueing" "$LOG" 2>/dev/null && pass "case 16: already-continued session skipped" || fail "case 16: not skipped: $(cat "$LOG" 2>/dev/null)"
+! grep -q -- "--resume" "$CALLS" && pass "case 16: no --resume call" || fail "case 16: duplicate resume started: $(cat "$CALLS" 2>/dev/null)"
 
 echo "---"
 echo "$PASS passed, $FAIL failed"
